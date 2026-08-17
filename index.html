@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>BSL Sign → Speech Translator</title>
+<style>
+  :root{--bg:#0f1115;--panel:#1a1d24;--accent:#4f8cff;--text:#e8eaf0;--muted:#8a8f9c;--good:#3ddc84;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+       min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px;}
+  h1{font-size:1.4rem;margin-bottom:4px;}
+  p.sub{color:var(--muted);font-size:.9rem;margin-bottom:20px;text-align:center;max-width:600px;}
+  .stage{position:relative;width:min(640px,92vw);border-radius:16px;overflow:hidden;background:#000;
+         box-shadow:0 8px 30px rgba(0,0,0,.5);}
+  video,canvas{position:absolute;top:0;left:0;width:100%;height:100%;transform:scaleX(-1);}
+  .panel{width:min(640px,92vw);background:var(--panel);border-radius:16px;padding:18px 20px;margin-top:16px;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;}
+  button{background:var(--accent);color:#fff;border:none;padding:10px 18px;border-radius:10px;
+         font-size:.95rem;cursor:pointer;transition:.15s;}
+  button:hover{filter:brightness(1.1);}
+  button.secondary{background:#2a2e38;}
+  button:disabled{opacity:.4;cursor:not-allowed;}
+  .output{background:#12141a;border-radius:10px;padding:14px;min-height:60px;font-size:1.1rem;line-height:1.5;}
+  .sign-tag{display:inline-block;background:var(--good);color:#04220f;font-weight:600;padding:2px 10px;
+            border-radius:6px;margin-right:6px;font-size:.85rem;}
+  .status{font-size:.8rem;color:var(--muted);margin-top:8px;}
+  .vocab{font-size:.8rem;color:var(--muted);margin-top:10px;line-height:1.6;}
+  .vocab b{color:var(--text);}
+</style>
+</head>
+<body>
+
+<h1>BSL Sign → Speech</h1>
+<p class="sub">In-browser hand tracking (MediaPipe) matches a small starter set of signs and speaks them aloud. No video leaves your device.</p>
+
+<div class="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <button id="startBtn">Start Camera</button>
+    <button id="stopBtn" class="secondary" disabled>Stop</button>
+    <button id="clearBtn" class="secondary">Clear Text</button>
+    <button id="muteBtn" class="secondary">🔊 Voice: On</button>
+  </div>
+  <div class="output" id="output">Recognized signs will appear here…</div>
+  <div class="status" id="status">Idle</div>
+  <div class="vocab">
+    <b>Starter vocabulary</b> (extend in the SIGNS object in the script): open palm → "Hello",
+    thumbs up → "Yes", fist → "No", pinch (thumb+index) → "Please", point up → "Help",
+    peace sign → "Thank you"
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script>
+/* ---------- CONFIG: add your own signs here ---------- */
+/* Each classifier returns true/false given 21 hand landmarks (MediaPipe format). */
+const SIGNS = {
+  "Hello (open palm)": lm => fingersUp(lm).every(f=>f) ,
+  "Yes (thumbs up)": lm => {
+    const f = fingersUp(lm);
+    return f[0] && !f[1] && !f[2] && !f[3] && !f[4] && isThumbUp(lm);
+  },
+  "No (fist)": lm => fingersUp(lm).every(f=>!f),
+  "Please (pinch)": lm => dist(lm[4], lm[8]) < 0.05 && fingersUp(lm)[2] && fingersUp(lm)[3] && fingersUp(lm)[4],
+  "Help (point up)": lm => {
+    const f = fingersUp(lm);
+    return !f[0] && f[1] && !f[2] && !f[3] && !f[4];
+  },
+  "Thank you (peace)": lm => {
+    const f = fingersUp(lm);
+    return !f[0] && f[1] && f[2] && !f[3] && !f[4];
+  }
+};
+
+/* ---------- helpers ---------- */
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);}
+function isThumbUp(lm){ return lm[4].y < lm[3].y && lm[3].y < lm[2].y; }
+// returns [thumb,index,middle,ring,pinky] booleans for "extended"
+function fingersUp(lm){
+  const tips=[4,8,12,16,20], pips=[3,6,10,14,18];
+  return tips.map((t,i)=>{
+    if(i===0) return dist(lm[t],lm[0]) > dist(lm[pips[i]],lm[0]); // thumb: distance-based
+    return lm[t].y < lm[pips[i]].y; // others: tip above pip = extended
+  });
+}
+
+/* ---------- DOM ---------- */
+const video=document.getElementById('video'), canvas=document.getElementById('overlay'),
+      ctx=canvas.getContext('2d'), output=document.getElementById('output'),
+      status=document.getElementById('status'), startBtn=document.getElementById('startBtn'),
+      stopBtn=document.getElementById('stopBtn'), clearBtn=document.getElementById('clearBtn'),
+      muteBtn=document.getElementById('muteBtn');
+
+let voiceOn=true, camera=null, lastSign=null, lastSpokenAt=0, holdCount=0;
+const HOLD_FRAMES=8, COOLDOWN_MS=2000;
+
+muteBtn.onclick=()=>{voiceOn=!voiceOn; muteBtn.textContent = voiceOn?'🔊 Voice: On':'🔇 Voice: Off';};
+clearBtn.onclick=()=>{output.innerHTML='Recognized signs will appear here…';};
+
+function speak(text){
+  if(!voiceOn) return;
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang='en-GB'; u.rate=1;
+  speechSynthesis.speak(u);
+}
+
+function classify(lm){
+  for(const name in SIGNS){ if(SIGNS[name](lm)) return name; }
+  return null;
+}
+
+function onResults(results){
+  canvas.width=video.videoWidth; canvas.height=video.videoHeight;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if(results.multiHandLandmarks && results.multiHandLandmarks.length){
+    const lm=results.multiHandLandmarks[0];
+    drawConnectors(ctx, lm, Hands.HAND_CONNECTIONS, {color:'#4f8cff',lineWidth:3});
+    drawLandmarks(ctx, lm, {color:'#3ddc84',radius:3});
+
+    const sign=classify(lm);
+    if(sign && sign===lastSign){ holdCount++; } else { holdCount=0; lastSign=sign; }
+
+    status.textContent = sign ? `Detecting: ${sign} (${holdCount}/${HOLD_FRAMES})` : 'Hand seen, no match';
+
+    if(sign && holdCount>=HOLD_FRAMES && Date.now()-lastSpokenAt>COOLDOWN_MS){
+      const word = sign.split(' (')[0];
+      output.innerHTML += `<span class="sign-tag">${word}</span>`;
+      speak(word);
+      lastSpokenAt=Date.now();
+      holdCount=0;
+    }
+  } else {
+    status.textContent='No hand detected';
+    lastSign=null; holdCount=0;
+  }
+}
+
+const hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:0.7,minTrackingConfidence:0.6});
+hands.onResults(onResults);
+
+startBtn.onclick=async ()=>{
+  status.textContent='Starting camera…';
+  camera=new Camera(video,{onFrame: async ()=>{ await hands.send({image:video}); }, width:640,height:480});
+  await camera.start();
+  startBtn.disabled=true; stopBtn.disabled=false;
+  status.textContent='Camera running';
+};
+stopBtn.onclick=()=>{
+  if(camera){ camera.stop(); }
+  const stream=video.srcObject; if(stream) stream.getTracks().forEach(t=>t.stop());
+  startBtn.disabled=false; stopBtn.disabled=true;
+  status.textContent='Stopped';
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+};
+</script>
+</body>
+</html>
